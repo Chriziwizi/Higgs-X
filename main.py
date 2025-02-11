@@ -4,15 +4,15 @@
 """
 Código unificado de Higgs (modo headless) para desplegar en Railway,
 usando la API gratuita de CoinGecko para obtener datos de mercado,
-calculando indicadores técnicos y generando señales de trading (solo en timeframe 1h)
-basadas en condiciones definidas (cruce de Bollinger Bands y medias móviles, RSI).
+calculando indicadores técnicos y generando señales de trading para el timeframe 1h
+basadas en condiciones definidas (cruce de Bollinger Bands, medias móviles y RSI).
 Incluye:
 - Configuración global.
 - Funciones para obtener datos OHLCV desde CoinGecko (usando days=7 para velas horarias).
 - Funciones de indicadores técnicos.
 - Nueva lógica de trading para señales de entrada en 1h con cálculo de Take Profit y Stop Loss.
 - Funciones para generar gráficos y enviar mensajes por Telegram.
-- Bot de Telegram para procesar mensajes.
+- Bot de Telegram para procesar mensajes (incluyendo consultas a OpenAI).
 - Función principal start() que arranca los procesos en hilos.
 """
 
@@ -28,7 +28,7 @@ from datetime import datetime
 import pytz
 import requests
 import pandas as pd
-import xgboost as xgb  # Aunque la lógica de ML se mantiene, la nueva señal no depende de ella
+import xgboost as xgb  # Se mantiene, pero la nueva lógica no depende de ML
 import openai
 import matplotlib
 matplotlib.use('Agg')  # Backend sin GUI
@@ -45,7 +45,7 @@ except Exception as e:
 # Variables de configuración global
 feature_columns = ['open', 'high', 'low', 'close', 'volume', 'sma_25', 'bb_low', 'bb_medium', 'bb_high']
 
-# (Se mantienen las claves de Binance solo para referencia; se eliminarán en la nueva lógica)
+# (Claves de Binance se mantienen para referencia y serán ignoradas)
 API_KEY_BINANCE = 'C7xBOQLYAf597cakk21IldpGzTSvQ0CDoTPjoG9ZvssDXCjd21Y18IwbSj9fJuhP'
 API_SECRET_BINANCE = 'khp4f2IdWOqloP98QU0mZz6VkmtJNfdAL9yL21RgZXGmppp75UmYvfWdpFS7ePL3'
 
@@ -60,13 +60,13 @@ COINGECKO_API_KEY = 'CG-9vur1PrpF89UrwBLERLsjEUL'
 OPENAI_API_KEY = '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'
 
 # Otros parámetros
-SYMBOL = 'BTC/USDT'  # Se mapea a "bitcoin" para CoinGecko
-TIMEFRAME = '1h'     # Indicativo: usaremos datos de los últimos 7 días para obtener velas horarias
+SYMBOL = 'BTC/USDT'      # Se mapea a "bitcoin" para CoinGecko
+TIMEFRAME = '1h'         # Indicativo: usaremos datos de los últimos 7 días para obtener velas horarias
 MAX_RETRIES = 5
 
-# Variables globales para señales de trading
+# Para señales de trading, reducimos el cooldown a 5 minutos
 last_trade_signal_time = None
-COOLDOWN_SECONDS = 3600  # Una señal cada 60 minutos
+COOLDOWN_SECONDS = 300  # 5 minutos
 
 # Configuración de OpenAI
 openai.api_key = OPENAI_API_KEY
@@ -86,7 +86,7 @@ COIN_ID_MAPPING = {
 def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=7):
     """
     Obtiene datos OHLC y volúmenes para la criptomoneda usando la API gratuita de CoinGecko.
-    Se usa days=7 para obtener velas horarias (aproximadamente).
+    Se usa days=7 para obtener velas horarias.
     Retorna un DataFrame con columnas: timestamp, open, high, low, close, volume.
     """
     coin_id = COIN_ID_MAPPING.get(symbol, "bitcoin")
@@ -109,7 +109,7 @@ def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=7):
     df_vol = pd.DataFrame(volumes, columns=["timestamp", "volume"])
     df_vol["timestamp"] = pd.to_datetime(df_vol["timestamp"], unit="ms")
     
-    # Fusionar OHLC y volúmenes (merge_asof)
+    # Fusionar los datos OHLC y volúmenes usando merge_asof
     df_ohlc = df_ohlc.sort_values("timestamp")
     df_vol = df_vol.sort_values("timestamp")
     df = pd.merge_asof(df_ohlc, df_vol, on="timestamp", direction="nearest")
@@ -212,7 +212,7 @@ def train_ml_model(data):
 def predict_ml(data):
     """
     Predice la dirección (subida o caída) utilizando ML.
-    Esta función se mantiene, pero la nueva lógica de trading usará condiciones específicas.
+    (Esta función se mantiene para consulta, pero la nueva lógica usa condiciones técnicas.)
     """
     global LAST_STABLE_PREDICTION
     data = add_extra_features(data)
@@ -230,17 +230,17 @@ def predict_ml(data):
 # ================================
 def generate_trade_signal(data):
     """
-    Genera una señal de trading basada en condiciones específicas para velas de 1h.
-    Se recomienda enviar señales de entrada LONG si se cumple:
-      - El low de la última vela es mayor que la banda superior (bb_high).
-      - La SMA de 10 periodos es mayor que la SMA de 25 periodos.
-      - El RSI es mayor que 50.
-    Para señal SHORT se recomienda:
-      - El high de la última vela es menor que la banda inferior (bb_low).
-      - La SMA de 10 es menor que la SMA de 25.
-      - El RSI es menor que 50.
-    Calcula el nivel de entrada, stop loss y take profit (con relación 1:2).
-    Retorna el mensaje de señal o None si no se cumplen condiciones.
+    Genera una señal de trading basada en condiciones técnicas para velas de 1h.
+    Condiciones para LONG:
+      - El low de la última vela supera la banda superior (bb_high).
+      - La SMA10 es mayor que SMA25.
+      - RSI > 50.
+    Condiciones para SHORT:
+      - El high de la última vela está por debajo de la banda inferior (bb_low).
+      - La SMA10 es menor que SMA25.
+      - RSI < 50.
+    Calcula el precio de entrada, stop loss y take profit (relación 1:2) y retorna el mensaje.
+    Si no se cumplen, retorna None.
     """
     indicators = calculate_indicators(data)
     price = indicators['price']
@@ -254,28 +254,28 @@ def generate_trade_signal(data):
     last_high = data['high'].iloc[-1]
     
     signal_message = None
+    # Condición para LONG
     if last_low > bb_high and sma_10 > sma_25 and rsi > 50:
-        # Señal LONG
         entry = price
         stop_loss = last_low
         risk = entry - stop_loss
         take_profit = entry + 2 * risk
-        signal_message = (f"Entrada Recomedada LONG (1h):\n"
-                          f"Precio de Entrada: ${entry:.2f}\n"
+        signal_message = (f"🚀 Señal LONG (1h):\n"
+                          f"Entrada: ${entry:.2f}\n"
                           f"Stop Loss: ${stop_loss:.2f}\n"
-                          f"Take Profit (estimado): ${take_profit:.2f}\n"
-                          f"RSI: {rsi:.2f}, SMA10: {sma_10:.2f}, SMA25: {sma_25:.2f}")
+                          f"Take Profit: ${take_profit:.2f}\n"
+                          f"(RSI: {rsi:.2f}, SMA10: {sma_10:.2f}, SMA25: {sma_25:.2f})")
+    # Condición para SHORT
     elif last_high < bb_low and sma_10 < sma_25 and rsi < 50:
-        # Señal SHORT
         entry = price
         stop_loss = last_high
         risk = stop_loss - entry
         take_profit = entry - 2 * risk
-        signal_message = (f"Entrada Recomedada SHORT (1h):\n"
-                          f"Precio de Entrada: ${entry:.2f}\n"
+        signal_message = (f"📉 Señal SHORT (1h):\n"
+                          f"Entrada: ${entry:.2f}\n"
                           f"Stop Loss: ${stop_loss:.2f}\n"
-                          f"Take Profit (estimado): ${take_profit:.2f}\n"
-                          f"RSI: {rsi:.2f}, SMA10: {sma_10:.2f}, SMA25: {sma_25:.2f}")
+                          f"Take Profit: ${take_profit:.2f}\n"
+                          f"(RSI: {rsi:.2f}, SMA10: {sma_10:.2f}, SMA25: {sma_25:.2f})")
     return signal_message
 
 # ================================
@@ -358,7 +358,7 @@ def handle_telegram_message(update):
     """
     Procesa los mensajes recibidos en Telegram.
     Si se detecta una petición de gráfico, llama a send_graphic;
-    en otro caso, obtiene datos, calcula indicadores y usa OpenAI para responder.
+    en otro caso, si se trata de una consulta, usa OpenAI para responder.
     """
     message_obj = update.get("message", {})
     message_text = message_obj.get("text", "").strip()
@@ -379,10 +379,10 @@ def handle_telegram_message(update):
         send_graphic(chat_id, timeframe, chart_type, days=7)
         return
 
-    # Si el mensaje es una consulta para OpenAI, procesamos la consulta:
+    # Si se trata de una consulta para OpenAI:
     context = (
         f"Hola agente @{username}, aquí Higgs X. Indicadores técnicos de {SYMBOL} (1h):\n"
-        f"(Consulta enviada: {message_text})"
+        f"(Consulta: {message_text})"
     )
     try:
         response = openai.ChatCompletion.create(
@@ -437,20 +437,19 @@ def telegram_bot_loop():
             time.sleep(10)
 
 # ================================
-# Sección 8: Monitor de Mercado y Generación de Señales
+# Sección 8: Monitor de Mercado y Señales de Trading
 # ================================
 def monitor_market():
     """
     Función principal de monitoreo:
     - Obtiene datos (velas horarias, usando days=7) y calcula indicadores.
-    - Genera una señal de trading basada en condiciones definidas para 1h.
-    - Solo envía una señal si ha pasado el cooldown (1h) desde la última señal.
+    - Genera una señal de trading basada en condiciones técnicas para 1h.
+    - Envía la señal si se cumple la condición y no hay cooldown activo (5 minutos).
     """
     global last_trade_signal_time
-    print("Obteniendo datos históricos para entrenar (si es necesario)...")
+    print("Obteniendo datos históricos para entrenamiento inicial...")
     data = fetch_data(SYMBOL, TIMEFRAME, days=7)
-    # Se entrena el modelo ML aunque la nueva lógica usa condiciones; esto puede mantenerse o eliminarse.
-    train_ml_model(data)
+    train_ml_model(data)  # Se entrena el modelo, aunque la nueva señal usa condiciones técnicas
     print("Datos obtenidos. Comenzando monitoreo en 1h...")
     while True:
         try:
@@ -458,15 +457,15 @@ def monitor_market():
             signal = generate_trade_signal(data)
             now = datetime.now()
             if signal is not None:
-                # Si ya se envió una señal recientemente, se ignora
+                # Enviar señal si ha pasado el cooldown (5 minutos) o si es la primera señal
                 if last_trade_signal_time is None or (now - last_trade_signal_time).total_seconds() >= COOLDOWN_SECONDS:
                     send_telegram_message(signal)
                     last_trade_signal_time = now
                 else:
-                    print("Cooldown activo, no se envía señal.")
+                    print("Cooldown activo, señal no enviada.")
             else:
                 print("No se cumplen condiciones para una señal de trading.")
-            # Dado que estamos trabajando con datos de 1h, se puede programar la revisión cada 5 minutos
+            # Revisión cada 5 minutos
             time.sleep(300)
         except Exception as e:
             print(f"Error en monitor_market: {e}")
@@ -480,14 +479,13 @@ def start():
     Función de inicio para Railway:
       - Inicia el bucle del bot de Telegram.
       - Inicia el monitor de mercado (con señales de trading en 1h).
-    Ambos se ejecutan en hilos separados.
+    Se ejecutan en hilos separados.
     """
     print("Iniciando Higgs en modo headless (trading 1h)...")
     bot_thread = threading.Thread(target=telegram_bot_loop, daemon=True)
     market_thread = threading.Thread(target=monitor_market, daemon=True)
     bot_thread.start()
     market_thread.start()
-    # Mantener el programa en ejecución
     while True:
         time.sleep(60)
 
