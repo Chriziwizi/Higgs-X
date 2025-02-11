@@ -17,6 +17,7 @@ Incluye:
 # =======================
 # Sección 1: Configuración
 # =======================
+import requests
 import sys
 import time
 import threading
@@ -33,6 +34,10 @@ import matplotlib
 matplotlib.use('Agg')  # Para backend sin GUI
 import matplotlib.pyplot as plt
 import mplfinance as mpf
+
+import requests
+ip = requests.get("https://ifconfig.me").text.strip()
+print(f"La IP pública actual es: {ip}")
 
 # Configuración global (los valores se toman de tu código original)
 feature_columns = ['open', 'high', 'low', 'close', 'volume', 'sma_25', 'bb_low', 'bb_medium', 'bb_high']
