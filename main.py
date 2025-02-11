@@ -85,25 +85,22 @@ COIN_ID_MAPPING = {
 # ================================
 def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=1):
     """
-    Obtiene datos OHLC y volúmenes para la criptomoneda usando la API de CoinGecko.
-    Se combinan dos endpoints: uno para OHLC y otro para los volúmenes.
+    Obtiene datos OHLC y volúmenes para la criptomoneda usando la API gratuita de CoinGecko.
     Retorna un DataFrame con columnas: timestamp, open, high, low, close, volume.
     """
     coin_id = COIN_ID_MAPPING.get(symbol, "bitcoin")
-    headers = {"x-cg-pro-api-key": COINGECKO_API_KEY}
-    
-    # Endpoint para OHLC: devuelve [timestamp, open, high, low, close]
+    # Endpoint para OHLC (versión gratuita)
     url_ohlc = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
-    response = requests.get(url_ohlc, headers=headers)
+    response = requests.get(url_ohlc)
     if response.status_code != 200:
         raise Exception(f"Error en CoinGecko OHLC: {response.text}")
     ohlc_data = response.json()
     df_ohlc = pd.DataFrame(ohlc_data, columns=["timestamp", "open", "high", "low", "close"])
     df_ohlc["timestamp"] = pd.to_datetime(df_ohlc["timestamp"], unit="ms")
     
-    # Endpoint para volúmenes y otros datos de mercado
+    # Endpoint para market_chart (volúmenes, etc.) - versión gratuita
     url_chart = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}"
-    response2 = requests.get(url_chart, headers=headers)
+    response2 = requests.get(url_chart)
     if response2.status_code != 200:
         raise Exception(f"Error en CoinGecko market_chart: {response2.text}")
     chart_data = response2.json()
@@ -111,11 +108,12 @@ def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=1):
     df_vol = pd.DataFrame(volumes, columns=["timestamp", "volume"])
     df_vol["timestamp"] = pd.to_datetime(df_vol["timestamp"], unit="ms")
     
-    # Fusionar los datos OHLC con los volúmenes usando merge_asof (suponiendo que ambos DataFrames estén ordenados)
+    # Fusionar los datos OHLC y volúmenes usando merge_asof (asegurarse de que ambos DataFrames estén ordenados)
     df_ohlc = df_ohlc.sort_values("timestamp")
     df_vol = df_vol.sort_values("timestamp")
     df = pd.merge_asof(df_ohlc, df_vol, on="timestamp", direction="nearest")
     return df
+
 
 def fetch_chart_data(symbol=SYMBOL, timeframe="1h", days=1, limit=None):
     """
