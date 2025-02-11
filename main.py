@@ -2,17 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Código unificado de Higgs (sin interfaz gráfica) para desplegar en Railway,
-usando la API de CoinGecko para obtener datos de mercado en lugar de Binance.
-
+Código unificado de Higgs (modo headless) para desplegar en Railway,
+usando la API gratuita de CoinGecko para obtener datos de mercado,
+calculando indicadores técnicos y generando señales de trading (solo en timeframe 1h)
+basadas en condiciones definidas (cruce de Bollinger Bands y medias móviles, RSI).
 Incluye:
 - Configuración global.
-- Funciones para obtener datos OHLCV desde CoinGecko.
+- Funciones para obtener datos OHLCV desde CoinGecko (usando days=7 para velas horarias).
 - Funciones de indicadores técnicos.
-- Modelo ML: entrenamiento y predicción.
-- Funciones para generar gráficos y enviarlos por Telegram.
-- Funciones para gestionar el bot de Telegram.
-- Función principal `start()` que arranca los procesos en paralelo.
+- Nueva lógica de trading para señales de entrada en 1h con cálculo de Take Profit y Stop Loss.
+- Funciones para generar gráficos y enviar mensajes por Telegram.
+- Bot de Telegram para procesar mensajes.
+- Función principal start() que arranca los procesos en hilos.
 """
 
 # =======================
@@ -27,7 +28,7 @@ from datetime import datetime
 import pytz
 import requests
 import pandas as pd
-import xgboost as xgb
+import xgboost as xgb  # Aunque la lógica de ML se mantiene, la nueva señal no depende de ella
 import openai
 import matplotlib
 matplotlib.use('Agg')  # Backend sin GUI
@@ -44,7 +45,7 @@ except Exception as e:
 # Variables de configuración global
 feature_columns = ['open', 'high', 'low', 'close', 'volume', 'sma_25', 'bb_low', 'bb_medium', 'bb_high']
 
-# (Se mantienen las claves de Binance solo para referencia, pero no se usarán)
+# (Se mantienen las claves de Binance solo para referencia; se eliminarán en la nueva lógica)
 API_KEY_BINANCE = 'C7xBOQLYAf597cakk21IldpGzTSvQ0CDoTPjoG9ZvssDXCjd21Y18IwbSj9fJuhP'
 API_SECRET_BINANCE = 'khp4f2IdWOqloP98QU0mZz6VkmtJNfdAL9yL21RgZXGmppp75UmYvfWdpFS7ePL3'
 
@@ -52,20 +53,20 @@ API_SECRET_BINANCE = 'khp4f2IdWOqloP98QU0mZz6VkmtJNfdAL9yL21RgZXGmppp75UmYvfWdpF
 TELEGRAM_TOKEN = '8066635436:AAH2E-ZnwNvf7G-fskKOTZD3oVvuLt05v8U'
 TELEGRAM_CHAT_ID = '-1002402692277'
 
-# Clave API de CoinGecko (para pruebas, se pone directo)
+# Clave API de CoinGecko (demo, se pone directo para pruebas)
 COINGECKO_API_KEY = 'CG-9vur1PrpF89UrwBLERLsjEUL'
 
 # OpenAI API key
 OPENAI_API_KEY = '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'
 
 # Otros parámetros
-SYMBOL = 'BTC/USDT'      # Para CoinGecko, mapearemos este símbolo a un ID de moneda
-TIMEFRAME = '1h'         # No se usará directamente, usaremos 'days' para CoinGecko
+SYMBOL = 'BTC/USDT'  # Se mapea a "bitcoin" para CoinGecko
+TIMEFRAME = '1h'     # Indicativo: usaremos datos de los últimos 7 días para obtener velas horarias
 MAX_RETRIES = 5
 
-# Variables globales para el modelo ML
-last_prediction = None
-LAST_STABLE_PREDICTION = None
+# Variables globales para señales de trading
+last_trade_signal_time = None
+COOLDOWN_SECONDS = 3600  # Una señal cada 60 minutos
 
 # Configuración de OpenAI
 openai.api_key = OPENAI_API_KEY
@@ -77,19 +78,19 @@ START_TIME = int(time.time())
 COIN_ID_MAPPING = {
     "BTC/USDT": "bitcoin",
     "ETH/USDT": "ethereum"
-    # Agrega otros mapeos si es necesario
 }
 
 # ================================
 # Sección 2: Funciones para obtener datos desde CoinGecko
 # ================================
-def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=1):
+def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=7):
     """
     Obtiene datos OHLC y volúmenes para la criptomoneda usando la API gratuita de CoinGecko.
+    Se usa days=7 para obtener velas horarias (aproximadamente).
     Retorna un DataFrame con columnas: timestamp, open, high, low, close, volume.
     """
     coin_id = COIN_ID_MAPPING.get(symbol, "bitcoin")
-    # Endpoint para OHLC (versión gratuita)
+    # Endpoint para OHLC (gratuito)
     url_ohlc = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
     response = requests.get(url_ohlc)
     if response.status_code != 200:
@@ -98,7 +99,7 @@ def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=1):
     df_ohlc = pd.DataFrame(ohlc_data, columns=["timestamp", "open", "high", "low", "close"])
     df_ohlc["timestamp"] = pd.to_datetime(df_ohlc["timestamp"], unit="ms")
     
-    # Endpoint para market_chart (volúmenes, etc.) - versión gratuita
+    # Endpoint para market_chart (volúmenes, etc.) - gratuito
     url_chart = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}"
     response2 = requests.get(url_chart)
     if response2.status_code != 200:
@@ -108,17 +109,15 @@ def fetch_data(symbol=SYMBOL, timeframe=TIMEFRAME, days=1):
     df_vol = pd.DataFrame(volumes, columns=["timestamp", "volume"])
     df_vol["timestamp"] = pd.to_datetime(df_vol["timestamp"], unit="ms")
     
-    # Fusionar los datos OHLC y volúmenes usando merge_asof (asegurarse de que ambos DataFrames estén ordenados)
+    # Fusionar OHLC y volúmenes (merge_asof)
     df_ohlc = df_ohlc.sort_values("timestamp")
     df_vol = df_vol.sort_values("timestamp")
     df = pd.merge_asof(df_ohlc, df_vol, on="timestamp", direction="nearest")
     return df
 
-
-def fetch_chart_data(symbol=SYMBOL, timeframe="1h", days=1, limit=None):
+def fetch_chart_data(symbol=SYMBOL, timeframe="1h", days=7, limit=None):
     """
-    Utiliza fetch_data para obtener un DataFrame y, si se especifica, limita el número de filas.
-    El parámetro 'timeframe' no se usa en CoinGecko, se utiliza 'days' para definir el rango.
+    Obtiene un DataFrame de datos y, si se especifica, limita el número de filas.
     """
     df = fetch_data(symbol, timeframe, days)
     if limit is not None:
@@ -134,32 +133,26 @@ from ta.volume import ChaikinMoneyFlowIndicator
 from ta.volatility import BollingerBands
 
 def calculate_indicators(data):
-    """Calcula indicadores técnicos (RSI, ADX, SMAs, MACD, Bollinger Bands, CMF) usando los datos."""
+    """Calcula indicadores técnicos (RSI, ADX, SMAs, MACD, Bollinger Bands, CMF)."""
     close = data['close']
     high = data['high']
     low = data['low']
-    # Para CMF se necesita volumen
     volume = data['volume']
     
-    # Chaikin Money Flow
     cmf = ChaikinMoneyFlowIndicator(high, low, close, volume).chaikin_money_flow().iloc[-1]
     volume_level = "Alto" if cmf > 0.1 else "Bajo" if cmf < -0.1 else "Moderado"
     
-    # SMAs
     sma_10 = SMAIndicator(close, window=10).sma_indicator().iloc[-1]
     sma_25 = SMAIndicator(close, window=25).sma_indicator().iloc[-1]
     sma_50 = SMAIndicator(close, window=50).sma_indicator().iloc[-1]
     
-    # MACD y señal
     macd_indicator = MACD(close)
     macd = macd_indicator.macd().iloc[-1]
     macd_signal = macd_indicator.macd_signal().iloc[-1]
     
-    # RSI y ADX
     rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
     adx = ADXIndicator(high, low, close).adx().iloc[-1]
     
-    # Bandas de Bollinger
     bb_indicator = BollingerBands(close, window=20, window_dev=2)
     bb_low = bb_indicator.bollinger_lband().iloc[-1]
     bb_medium = bb_indicator.bollinger_mavg().iloc[-1]
@@ -219,12 +212,12 @@ def train_ml_model(data):
 def predict_ml(data):
     """
     Predice la dirección (subida o caída) utilizando ML.
-    Si la probabilidad se encuentra en un rango de incertidumbre, retiene la última predicción.
+    Esta función se mantiene, pero la nueva lógica de trading usará condiciones específicas.
     """
     global LAST_STABLE_PREDICTION
     data = add_extra_features(data)
     features = data[feature_columns].pct_change().dropna().iloc[-1:][feature_columns]
-    prob = MODEL.predict_proba(features)[0]  # [prob_clase0, prob_clase1]
+    prob = MODEL.predict_proba(features)[0]
     if 0.45 < prob[1] < 0.55 and LAST_STABLE_PREDICTION is not None:
         prediction = LAST_STABLE_PREDICTION
     else:
@@ -233,22 +226,74 @@ def predict_ml(data):
     return '📈 Dirección xML: Subida Esperada' if prediction == 1 else '📉 Dirección xML: Caída Esperada'
 
 # ================================
-# Sección 5: Gráficos y Envío a Telegram
+# Sección 5: Nueva Lógica de Trading para 1h
 # ================================
-def send_graphic(chat_id, timeframe_input="1h", chart_type="line", days=1):
+def generate_trade_signal(data):
+    """
+    Genera una señal de trading basada en condiciones específicas para velas de 1h.
+    Se recomienda enviar señales de entrada LONG si se cumple:
+      - El low de la última vela es mayor que la banda superior (bb_high).
+      - La SMA de 10 periodos es mayor que la SMA de 25 periodos.
+      - El RSI es mayor que 50.
+    Para señal SHORT se recomienda:
+      - El high de la última vela es menor que la banda inferior (bb_low).
+      - La SMA de 10 es menor que la SMA de 25.
+      - El RSI es menor que 50.
+    Calcula el nivel de entrada, stop loss y take profit (con relación 1:2).
+    Retorna el mensaje de señal o None si no se cumplen condiciones.
+    """
+    indicators = calculate_indicators(data)
+    price = indicators['price']
+    rsi = indicators['rsi']
+    sma_10 = indicators['sma_10']
+    sma_25 = indicators['sma_25']
+    bb_low = indicators['bb_low']
+    bb_high = indicators['bb_high']
+    
+    last_low = data['low'].iloc[-1]
+    last_high = data['high'].iloc[-1]
+    
+    signal_message = None
+    if last_low > bb_high and sma_10 > sma_25 and rsi > 50:
+        # Señal LONG
+        entry = price
+        stop_loss = last_low
+        risk = entry - stop_loss
+        take_profit = entry + 2 * risk
+        signal_message = (f"Entrada Recomedada LONG (1h):\n"
+                          f"Precio de Entrada: ${entry:.2f}\n"
+                          f"Stop Loss: ${stop_loss:.2f}\n"
+                          f"Take Profit (estimado): ${take_profit:.2f}\n"
+                          f"RSI: {rsi:.2f}, SMA10: {sma_10:.2f}, SMA25: {sma_25:.2f}")
+    elif last_high < bb_low and sma_10 < sma_25 and rsi < 50:
+        # Señal SHORT
+        entry = price
+        stop_loss = last_high
+        risk = stop_loss - entry
+        take_profit = entry - 2 * risk
+        signal_message = (f"Entrada Recomedada SHORT (1h):\n"
+                          f"Precio de Entrada: ${entry:.2f}\n"
+                          f"Stop Loss: ${stop_loss:.2f}\n"
+                          f"Take Profit (estimado): ${take_profit:.2f}\n"
+                          f"RSI: {rsi:.2f}, SMA10: {sma_10:.2f}, SMA25: {sma_25:.2f}")
+    return signal_message
+
+# ================================
+# Sección 6: Gráficos y Envío a Telegram
+# ================================
+def send_graphic(chat_id, timeframe_input="1h", chart_type="line", days=7):
     """
     Genera un gráfico (lineal o de velas) a partir de los datos obtenidos vía CoinGecko
     y lo envía a Telegram.
     """
     try:
-        # Aunque CoinGecko no usa 'timeframe' directamente, permitimos su uso en el mensaje.
         df = fetch_chart_data(SYMBOL, timeframe_input, days=days, limit=100)
         support = df['close'].min()
         resistance = df['close'].max()
         sma20 = df['close'].rolling(window=20).mean()
         sma50 = df['close'].rolling(window=50).mean()
         buf = io.BytesIO()
-        caption = f"Gráfico de {SYMBOL} - Último {days} día(s)"
+        caption = f"Gráfico de {SYMBOL} - Últimos {days} día(s)"
         
         if chart_type.lower() == "candlestick":
             mc = mpf.make_marketcolors(up='g', down='r', inherit=True)
@@ -259,7 +304,7 @@ def send_graphic(chat_id, timeframe_input="1h", chart_type="line", days=1):
             sr_resistance = [resistance] * len(df)
             ap2 = mpf.make_addplot(sr_support, color='green', linestyle='--', width=0.8)
             ap3 = mpf.make_addplot(sr_resistance, color='red', linestyle='--', width=0.8)
-            fig, axlist = mpf.plot(
+            fig, _ = mpf.plot(
                 df,
                 type='candle',
                 style=s,
@@ -296,9 +341,6 @@ def send_graphic(chat_id, timeframe_input="1h", chart_type="line", days=1):
     except Exception as e:
         print(f"Error en send_graphic: {e}")
 
-# ================================
-# Sección 6: Telegram Handler
-# ================================
 def send_telegram_message(message, chat_id=None):
     """Envía un mensaje a Telegram."""
     if not chat_id:
@@ -316,7 +358,7 @@ def handle_telegram_message(update):
     """
     Procesa los mensajes recibidos en Telegram.
     Si se detecta una petición de gráfico, llama a send_graphic;
-    en otro caso, obtiene datos, calcula indicadores y usa OpenAI para generar una respuesta.
+    en otro caso, obtiene datos, calcula indicadores y usa OpenAI para responder.
     """
     message_obj = update.get("message", {})
     message_text = message_obj.get("text", "").strip()
@@ -329,27 +371,18 @@ def handle_telegram_message(update):
         return
     lower_msg = message_text.lower()
     
-    # Si se solicita un gráfico:
     if any(phrase in lower_msg for phrase in ["grafico", "gráfico"]):
-        timeframe = extract_timeframe(lower_msg)
+        timeframe = "1h"  # Para gráficos, siempre 1h
         chart_type = "line"
         if any(keyword in lower_msg for keyword in ["vela", "velas", "candlestick", "japonesas"]):
             chart_type = "candlestick"
-        send_graphic(chat_id, timeframe, chart_type, days=1)
+        send_graphic(chat_id, timeframe, chart_type, days=7)
         return
 
-    # Obtener datos y calcular indicadores
-    data = fetch_data(SYMBOL, TIMEFRAME, days=1)
-    indicators = calculate_indicators(data)
+    # Si el mensaje es una consulta para OpenAI, procesamos la consulta:
     context = (
-        f"Hola agente @{username}, aquí Higgs X. Indicadores técnicos de {SYMBOL}:\n"
-        f"- Precio: ${indicators['price']:.2f}\n"
-        f"- RSI: {indicators['rsi']:.2f}\n"
-        f"- MACD: {indicators['macd']:.2f} (Señal: {indicators['macd_signal']:.2f})\n"
-        f"- SMA10: {indicators['sma_10']:.2f} | SMA25: {indicators['sma_25']:.2f} | SMA50: {indicators['sma_50']:.2f}\n"
-        f"- Volumen: {indicators['volume_level']} (CMF: {indicators['cmf']:.2f})\n"
-        f"- Bandas de Bollinger: Low ${indicators['bb_low']:.2f}, Med ${indicators['bb_medium']:.2f}, High ${indicators['bb_high']:.2f}\n\n"
-        f"Pregunta: {message_text}"
+        f"Hola agente @{username}, aquí Higgs X. Indicadores técnicos de {SYMBOL} (1h):\n"
+        f"(Consulta enviada: {message_text})"
     )
     try:
         response = openai.ChatCompletion.create(
@@ -404,93 +437,40 @@ def telegram_bot_loop():
             time.sleep(10)
 
 # ================================
-# Sección 8: Monitor de Mercado
+# Sección 8: Monitor de Mercado y Generación de Señales
 # ================================
-# Parámetros para alertas
-VOLATILITY_THRESHOLD = 0.02  
-ML_MSG_WINDOW_MIN = 5    # en minutos
-STABILIZATION_WINDOW_MIN = 10
-ALERT_LEVELS = {
-    'level_1': {'threshold': 4, 'window': 1},
-    'level_2': {'threshold': 5, 'window': 5},
-    'level_3': {'threshold': 10, 'window': 10}
-}
-
-# Variables de control para el monitoreo
-last_prediction = None
-last_prediction_time = None
-ml_message_timestamps = []
-last_volatility_alert_time = None
-last_volatility_state = None
-
 def monitor_market():
     """
     Función principal de monitoreo:
-    - Entrena el modelo con datos históricos.
-    - En un bucle, obtiene datos actualizados, calcula indicadores, predice la dirección y envía alertas por Telegram.
+    - Obtiene datos (velas horarias, usando days=7) y calcula indicadores.
+    - Genera una señal de trading basada en condiciones definidas para 1h.
+    - Solo envía una señal si ha pasado el cooldown (1h) desde la última señal.
     """
-    global last_prediction, last_prediction_time, ml_message_timestamps, last_volatility_alert_time, last_volatility_state
-    print("Entrenando modelo ML con datos históricos...")
-    data = fetch_data(SYMBOL, TIMEFRAME, days=1)
+    global last_trade_signal_time
+    print("Obteniendo datos históricos para entrenar (si es necesario)...")
+    data = fetch_data(SYMBOL, TIMEFRAME, days=7)
+    # Se entrena el modelo ML aunque la nueva lógica usa condiciones; esto puede mantenerse o eliminarse.
     train_ml_model(data)
-    print("Modelo ML entrenado. Comenzando monitoreo...")
+    print("Datos obtenidos. Comenzando monitoreo en 1h...")
     while True:
         try:
-            data = fetch_data(SYMBOL, TIMEFRAME, days=1)
-            indicators = calculate_indicators(data)
-            ml_prediction = predict_ml(data)
-            message = (
-                f"📊 Precio Actual {SYMBOL}: ${indicators['price']:.2f}\n"
-                f"RSI: {indicators['rsi']:.2f} | ADX: {indicators['adx']:.2f}\n"
-                f"MACD: {indicators['macd']:.2f} (Señal: {indicators['macd_signal']:.2f})\n"
-                f"SMA10: {indicators['sma_10']:.2f} | SMA25: {indicators['sma_25']:.2f} | SMA50: {indicators['sma_50']:.2f}\n"
-                f"Volumen: {indicators['volume_level']} (CMF: {indicators['cmf']:.2f})\n\n"
-                f"Bandas de Bollinger:\n"
-                f"Low: ${indicators['bb_low']:.2f}\n"
-                f"Med: ${indicators['bb_medium']:.2f}\n"
-                f"High: ${indicators['bb_high']:.2f}\n\n"
-                f"{ml_prediction}"
-            )
+            data = fetch_data(SYMBOL, TIMEFRAME, days=7)
+            signal = generate_trade_signal(data)
             now = datetime.now()
-            if ml_prediction != last_prediction:
-                send_telegram_message(message)
-                last_prediction = ml_prediction
-                last_prediction_time = now
-                ml_message_timestamps.append(now)
-                ml_message_timestamps = [ts for ts in ml_message_timestamps if (now - ts).total_seconds() < ML_MSG_WINDOW_MIN * 60]
-                for level, params in ALERT_LEVELS.items():
-                    if len(ml_message_timestamps) >= params['threshold']:
-                        if (last_volatility_alert_time is None or 
-                            (now - last_volatility_alert_time).total_seconds() / 60 >= params['window']):
-                            alert = (f"¡Alerta de Volatilidad!⚠️ {len(ml_message_timestamps)} cambios en los últimos {params['window']} minutos. "
-                                     "Revisa el mercado.")
-                            send_telegram_message(alert)
-                            last_volatility_alert_time = now
-                            break
-            if last_prediction_time is not None:
-                elapsed = (now - last_prediction_time).total_seconds() / 60.0
-                if elapsed >= STABILIZATION_WINDOW_MIN:
-                    stabilization_msg = ("El mercado se ha estabilizado✳️ "
-                                         "Han pasado más de 10 minutos sin cambios en la dirección. "
-                                         "Mantente atento.")
-                    send_telegram_message(stabilization_msg)
-                    last_prediction_time = now
-            returns = data['close'].pct_change().dropna()
-            current_volatility = returns.std()
-            volatility_state = 'alta' if current_volatility > VOLATILITY_THRESHOLD else 'estable'
-            if last_volatility_state is None:
-                last_volatility_state = volatility_state
-            elif volatility_state != last_volatility_state:
-                if volatility_state == 'alta':
-                    alert = ("¡Atención!⚠️ El mercado está experimentando alta volatilidad.")
+            if signal is not None:
+                # Si ya se envió una señal recientemente, se ignora
+                if last_trade_signal_time is None or (now - last_trade_signal_time).total_seconds() >= COOLDOWN_SECONDS:
+                    send_telegram_message(signal)
+                    last_trade_signal_time = now
                 else:
-                    alert = ("El mercado se ha estabilizado. Revisa tus estrategias.")
-                send_telegram_message(alert)
-                last_volatility_state = volatility_state
-            time.sleep(10)
+                    print("Cooldown activo, no se envía señal.")
+            else:
+                print("No se cumplen condiciones para una señal de trading.")
+            # Dado que estamos trabajando con datos de 1h, se puede programar la revisión cada 5 minutos
+            time.sleep(300)
         except Exception as e:
             print(f"Error en monitor_market: {e}")
-            time.sleep(10)
+            time.sleep(300)
 
 # ================================
 # Sección 9: Función Start (Punto de Entrada)
@@ -499,10 +479,10 @@ def start():
     """
     Función de inicio para Railway:
       - Inicia el bucle del bot de Telegram.
-      - Inicia el monitor de mercado.
+      - Inicia el monitor de mercado (con señales de trading en 1h).
     Ambos se ejecutan en hilos separados.
     """
-    print("Iniciando Higgs en modo headless...")
+    print("Iniciando Higgs en modo headless (trading 1h)...")
     bot_thread = threading.Thread(target=telegram_bot_loop, daemon=True)
     market_thread = threading.Thread(target=monitor_market, daemon=True)
     bot_thread.start()
