@@ -1,0 +1,9 @@
+ccxt
+pandas
+xgboost
+openai
+ta
+pytz
+matplotlib
+mplfinance
+requests
